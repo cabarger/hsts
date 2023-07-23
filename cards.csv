@@ -1,0 +1,4 @@
+name,damage,d_upgrade_damge,block,d_upgrade_block,vulnerable,d_upgrade_vulnerable
+Strike,6,3,0,0,0,0
+Defend,0,0,5,3,0,0
+Bash,8,2,0,0,2,3
