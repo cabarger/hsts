@@ -1,14 +1,21 @@
 const std = @import("std");
-
+const builtin = @import("builtin");
 const fmt = std.fmt;
+const mem = std.mem;
+const debug = std.debug;
 
 const Xoshiro128 = std.rand.Xoroshiro128;
 
 const path_dens = 6;
-const map_rows: usize = 15;
-const map_cols: usize = 7;
-const seed = 5;
+const map_rows = 15;
+const map_cols = 7;
+const seed = 6;
+const max_cards_in_hand = 10;
+const max_monsters_per_combat = 5;
 const cards_csv_path = "cards.csv";
+
+const boss_floor_edge_index = std.math.maxInt(usize);
+const neow_floor_edge_index = std.math.maxInt(usize) - 1;
 
 const location_distribution = [_]f32{
     0.45, // monster
@@ -26,6 +33,7 @@ const LocationType = enum {
     rest,
     merchant,
     treasure,
+    boss,
 };
 
 const CardType = enum {
@@ -36,17 +44,28 @@ const CardType = enum {
     curse,
 };
 
-// const Relic = enum {};
-// const relic_names = [_][]const u8{
-//     "Burning Blood",
-// };
+const MonsterType = enum {
+    cultist,
+};
 
-const WTFDoDim = enum {
+const Monster = struct {
+    type: MonsterType,
+    hp: u16,
+};
+
+const WTFDoDim = enum(usize) {
+    card_type,
     damage,
     block,
     vulnerable,
+    ritual,
 
     len,
+};
+
+const Card = struct {
+    id: u8,
+    wtf_do: @Vector(@intFromEnum(WTFDoDim.len), u8),
 };
 
 const Location = struct {
@@ -76,6 +95,15 @@ const Location = struct {
         return false;
     }
 };
+
+// --- TTY functions ---
+fn moveCursor(out_stream: anytype, row: usize, col: usize) !void {
+    try out_stream.print("\x1b[{d};{d}H", .{ row, col });
+}
+
+fn clearScreen(out_stream: anytype) !void {
+    try out_stream.writeAll("\x1b[2J");
+}
 
 fn parentLocations(map: []Location, coords: @Vector(2, usize)) [3]?*Location {
     var result = [3]?*Location{ null, null, null };
@@ -165,7 +193,7 @@ pub fn generateMap(rand: std.rand.Random, map: []Location) void {
                 map[floorIndexToMapRowIndex(row_index) * map_cols + curr_col_index].path_generation_index = @as(u8, @truncate(path_gen_index));
                 curr_col_index = @as(u8, @intCast(@as(i8, @intCast(curr_col_index)) + next_col_dx));
             } else {
-                map[floorIndexToMapRowIndex(row_index) * map_cols + curr_col_index].insertEdge(std.math.maxInt(usize)); // FIXME(caleb)
+                map[floorIndexToMapRowIndex(row_index) * map_cols + curr_col_index].insertEdge(boss_floor_edge_index);
             }
         }
     }
@@ -180,10 +208,75 @@ pub fn generateMap(rand: std.rand.Random, map: []Location) void {
     }
 }
 
-pub fn drawMap(map: []Location, tty: std.io.tty.Config, out_stream: anytype) !void {
+const WhaleBonus = enum(u8) {
+    max_hp,
+    lament,
+    adv_and_disadv,
+    boss_relic_swap,
+};
+
+const Relic = enum {
+    burning_blood,
+    ring_of_the_snake,
+    cracked_core,
+    pure_water,
+    neows_lament,
+};
+
+// NOTE(caleb): 2 for A20 potion cap. Another 2 if potion belt relic is acquired.
+const max_potion_slots = 2 + 2;
+
+const PlayerState = struct {
+    hp: u8 = 68, // FIXME(caleb): Stop initializing with Ironclad hp
+    max_hp: u8 = 75,
+    gold: u16 = 99,
+    potions: [max_potion_slots]u8 = undefined,
+
+    relic_count: u8 = 0,
+    relics: [100]Relic = undefined,
+
+    pub fn addRelic(ps: *PlayerState, relic: Relic) void {
+        debug.assert(ps.relic_count + 1 <= ps.relics.len);
+        ps.relics[ps.relic_count] = relic;
+        ps.relic_count += 1;
+    }
+};
+
+const GameState = struct {
+    floor_number: usize = 0,
+    map_col_index: usize = 0,
+};
+
+fn getInputOptionIndex(output_stream: anytype, input_stream: anytype, input_fbs: *std.io.FixedBufferStream([]u8), valid_option_indices: []const u8) !?usize {
+    const deal_with_crs = if (builtin.target.os.tag == .windows) true else false;
+    try output_stream.writeAll("> ");
+    input_fbs.reset();
+    try streamAppropriately(deal_with_crs, input_stream, input_fbs.writer());
+    const selected_index = fmt.parseUnsigned(u8, input_fbs.getWritten(), 10) catch return null;
+    for (valid_option_indices) |option_index|
+        if (option_index == selected_index)
+            return selected_index;
+    return null;
+}
+
+fn drawHUD(out_stream: anytype, player_state: *PlayerState, game_state: *GameState) !void {
+    try moveCursor(out_stream, 0, 0);
+    try out_stream.print("\x1b[1mCaleb\x1b[22m \x1b[2mThe Ironclad\x1b[22m HP: {d}/{d} gold: {d} pot,pot floor: {d} A20\n\r", .{
+        player_state.hp,
+        player_state.max_hp,
+        player_state.gold,
+        game_state.floor_number,
+    });
+    var relic_index: usize = 0;
+    while (relic_index < player_state.relic_count) : (relic_index += 1)
+        try out_stream.print("{s} ", .{@tagName(player_state.relics[relic_index])[0..2]});
+    try out_stream.writeAll("\r\n");
+}
+
+fn drawMap(map: []Location, tty: std.io.tty.Config, out_stream: anytype) !void {
     try out_stream.print("\tboss floor\n", .{});
     for (0..map_rows) |row_index| {
-        try out_stream.print("{d:2}. ", .{@as(u8, @intCast(map_rows - row_index - 1))});
+        try out_stream.print("{d:2}. ", .{@as(u8, @intCast(map_rows - row_index))});
         for (0..map_cols) |col_index| {
             try tty.setColor(out_stream, @as(std.io.tty.Color, @enumFromInt(@intFromEnum(std.io.tty.Color.red) +
                 map[row_index * map_cols + col_index].path_generation_index)));
@@ -217,16 +310,19 @@ pub fn main() !void {
     var rand = xoshi.random();
 
     const stdout_file = std.io.getStdOut();
+    const stdin_file = std.io.getStdIn();
     const stdout = stdout_file.writer();
+    var stdin_buf: [1024]u8 = undefined;
+    var stdin_fbs = std.io.fixedBufferStream(&stdin_buf);
+    var stdin_writer = stdin_fbs.writer();
+    const stdin = stdin_file.reader();
     const tty = std.io.tty.detectConfig(stdout_file);
-
-    var map: [map_rows * map_cols]Location = undefined;
-    generateMap(rand, &map);
-    try drawMap(&map, tty, stdout);
 
     var card_names = std.ArrayList([]const u8).init(arena);
     var cards_wtf_do = std.ArrayList(@Vector(@intFromEnum(WTFDoDim.len), u8)).init(arena);
     var cards_d_upgrade_wtf_do = std.ArrayList(@Vector(@intFromEnum(WTFDoDim.len), u8)).init(arena);
+    var card_map = std.StringHashMap(u8).init(arena);
+    var card_count: u8 = 0;
     {
         const cards_file = try std.fs.cwd().openFile(cards_csv_path, .{});
         defer cards_file.close();
@@ -255,7 +351,8 @@ pub fn main() !void {
             const vulnerable = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
             const d_upgrade_vulnerable = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
 
-            try card_names.append(name);
+            const duped_name = try arena.dupe(u8, name);
+            try card_names.append(duped_name);
 
             var wtf_do = std.mem.zeroes(@Vector(@intFromEnum(WTFDoDim.len), u8));
             wtf_do[@intFromEnum(WTFDoDim.damage)] = damage;
@@ -268,6 +365,175 @@ pub fn main() !void {
             d_upgrade_wtf_do[@intFromEnum(WTFDoDim.block)] = d_upgrade_block;
             d_upgrade_wtf_do[@intFromEnum(WTFDoDim.vulnerable)] = d_upgrade_vulnerable;
             try cards_d_upgrade_wtf_do.append(d_upgrade_wtf_do);
+
+            try card_map.put(duped_name, card_count);
+            card_count += 1;
+        }
+    }
+
+    var player_state = PlayerState{};
+    var game_state = GameState{};
+    var map: [map_rows * map_cols]Location = undefined;
+    generateMap(rand, &map);
+
+    // Ironclad starter deck is 5 strikes, 4 defends, 1 bash, and 1 ascender's bane at 10+ ascention.
+    var deck = std.ArrayList(Card).init(arena);
+    const strike_id = card_map.get("Strike") orelse unreachable;
+    const defend_id = card_map.get("Defend") orelse unreachable;
+    const bash_id = card_map.get("Bash") orelse unreachable;
+    const ascenders_bane_id = card_map.get("Ascender's Bane") orelse unreachable;
+    for (0..5) |_| try deck.append(.{ .id = strike_id, .wtf_do = cards_wtf_do.items[strike_id] });
+    for (0..4) |_| try deck.append(.{ .id = defend_id, .wtf_do = cards_wtf_do.items[defend_id] });
+    try deck.append(.{ .id = bash_id, .wtf_do = cards_wtf_do.items[bash_id] });
+    try deck.append(.{ .id = ascenders_bane_id, .wtf_do = cards_wtf_do.items[ascenders_bane_id] });
+
+    // Starter relic
+    player_state.relics[0] = Relic.burning_blood;
+    player_state.relic_count += 1;
+
+    while (true) { // Game loop
+        try clearScreen(stdout);
+        try moveCursor(stdout, 0, 0);
+        try drawHUD(stdout, &player_state, &game_state);
+
+        const location_type = if (game_state.floor_number % 15 != 0)
+            map[floorIndexToMapRowIndex(game_state.floor_number - 1) * map_cols + game_state.map_col_index].type
+        else if (game_state.floor_number == 0)
+            LocationType.event
+        else
+            LocationType.boss;
+
+        switch (location_type) {
+            .monster, .elite, .boss => {
+                var draw_pile = std.ArrayList(u8).init(arena);
+                for (deck.items) |card| try draw_pile.append(card.id);
+                rand.shuffle(u8, draw_pile.items);
+
+                var hand: [max_cards_in_hand]u8 = undefined;
+                for (&hand) |*card_index| card_index.* = 0;
+                var cards_in_hand: u8 = 0;
+
+                var discard_pile = std.ArrayList(usize).init(arena);
+                _ = discard_pile;
+
+                var monsters_in_combat: [max_monsters_per_combat]Monster = undefined;
+                var n_monsters_in_encouter = @as(u8, 1);
+
+                //TODO(caleb): 50-56 is the valid range for a cultist's hp
+                monsters_in_combat[0] = .{ .type = .cultist, .hp = 56 };
+
+                var turn_number: usize = 0;
+                while (true) : (turn_number += 1) { // Combat loop
+                    for (monsters_in_combat[0..n_monsters_in_encouter]) |monster| {
+                        switch (monster.type) {
+                            .cultist => {
+                                if (turn_number == 0) { // Incantation: gain strength every turn
+                                    // TODO(caleb): cast ritual
+                                }
+                            },
+                        }
+                    }
+
+                    // Draw some cards
+                    while (cards_in_hand < 5) : (cards_in_hand += 1) {
+
+                        // TODO(caleb): Shuffle discard pile back into draw pile
+
+                        const card_index = draw_pile.pop();
+                        hand[cards_in_hand] = card_index;
+                    }
+
+                    for (0..cards_in_hand) |hand_index| try stdout.print("{d: ^4}", .{hand_index});
+                    try stdout.writeByte('\n');
+                    for (hand[0..cards_in_hand]) |card_index|
+                        try stdout.print("{s},", .{card_names.items[card_index][0..3]});
+                    try stdout.writeByte('\n');
+
+                    // Test fight with cultist
+                    try stdout.writeAll("> ");
+                    try streamAppropriately(false, stdin, stdin_writer);
+                    // std.debug.print("{d}.) {s} \n", .{stdin_fbs.getWritten()});
+
+                    // TODO(caleb): Handle selecting and playing card.
+                }
+            },
+            .event => {
+                if (game_state.floor_number == 0) { // Whale bonus
+                    // NOTE(caleb): Map is useful when choosing a whale bonus.
+                    try clearScreen(stdout);
+                    try moveCursor(stdout, 0, 0);
+                    try drawHUD(stdout, &player_state, &game_state);
+                    try drawMap(&map, tty, stdout);
+
+                    const option_strs = &[_][]const u8{
+                        "Max HP +8",
+                        "Enemies in the next three combat will have one health.",
+                    };
+                    while (true) {
+                        for (option_strs, 0..) |option_str, option_str_index|
+                            try stdout.print("{d}.) {s}\n", .{ option_str_index, option_str });
+                        const option_index = (try getInputOptionIndex(stdout, stdin, &stdin_fbs, &[_]u8{ 0, 1 })) orelse continue;
+                        const whale_bonus = @as(WhaleBonus, @enumFromInt(option_index));
+                        switch (whale_bonus) {
+                            .max_hp => {
+                                player_state.max_hp += 8;
+                                player_state.hp += 8;
+                            },
+                            .lament => player_state.addRelic(.neows_lament),
+                            else => unreachable,
+                        }
+                        break;
+                    }
+                } else unreachable;
+            },
+            .rest => unreachable,
+            .merchant => unreachable,
+            .treasure => unreachable,
+        }
+
+        // Finished doing location stuff decide where to go now!
+        try clearScreen(stdout);
+        try moveCursor(stdout, 0, 0);
+        try drawHUD(stdout, &player_state, &game_state);
+        try drawMap(&map, tty, stdout);
+
+        var valid_col_indices: [map_cols]u8 = undefined;
+        var valid_col_indices_count: u8 = 0;
+        if (game_state.floor_number % 15 != 0) {
+            var at_least_col_dx = if (game_state.map_col_index > 0) @as(i8, -1) else @as(i8, 0);
+            var less_than_col_dx = if (game_state.map_col_index < map_cols - 1) @as(i8, 2) else @as(i8, 1);
+            var d_col_index: i8 = at_least_col_dx;
+            while (d_col_index < less_than_col_dx) : (d_col_index += 1) {
+                if (map[floorIndexToMapRowIndex(game_state.floor_number - 1) * map_cols + game_state.map_col_index]
+                    .hasEdgeWithIndex(floorIndexToMapRowIndex(game_state.floor_number) * map_cols +
+                    @as(u8, @intCast(@as(i8, @intCast(game_state.map_col_index)) + d_col_index))))
+                {
+                    valid_col_indices[valid_col_indices_count] = @as(u8, @intCast(@as(i8, @intCast(game_state.map_col_index)) + d_col_index));
+                    valid_col_indices_count += 1;
+                }
+            }
+        } else if (game_state.floor_number == 0) {
+            for (0..map_cols) |col_index| {
+                if (map[(map_rows - 1) * map_cols + col_index].edgeCount() > 0) {
+                    valid_col_indices[valid_col_indices_count] = @as(u8, @truncate(col_index));
+                    valid_col_indices_count += 1;
+                }
+            }
+        } else { // Only option is boss fight
+            valid_col_indices[valid_col_indices_count] = 0;
+            valid_col_indices_count = 1;
+        }
+        while (true) {
+            try stdout.print("{d}\n", .{valid_col_indices[0..valid_col_indices_count]});
+            const selected_index = (try getInputOptionIndex(
+                stdout,
+                stdin,
+                &stdin_fbs,
+                valid_col_indices[0..valid_col_indices_count],
+            )) orelse continue;
+            game_state.floor_number += 1;
+            game_state.map_col_index = selected_index;
+            break;
         }
     }
 

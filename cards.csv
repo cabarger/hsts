@@ -1,4 +1,5 @@
-name,damage,d_upgrade_damge,block,d_upgrade_block,vulnerable,d_upgrade_vulnerable
-Strike,6,3,0,0,0,0
-Defend,0,0,5,3,0,0
-Bash,8,2,0,0,2,3
+name,type,damage,d_upgrade_damge,block,d_upgrade_block,vulnerable,d_upgrade_vulnerable
+Strike,0,6,3,0,0,0,0
+Defend,1,0,0,5,3,0,0
+Bash,0,8,2,0,0,2,3
+Ascender's Bane,4,0,0,0,0,0,0
