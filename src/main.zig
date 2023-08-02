@@ -4,11 +4,13 @@ const fmt = std.fmt;
 const mem = std.mem;
 const debug = std.debug;
 const time = std.time;
+const windows = std.os.windows;
 
 const Deck = @import("Deck.zig");
 const Cards = @import("Cards.zig");
 const Map = @import("Map.zig");
 const Location = @import("Location.zig");
+const Console = @import("Console.zig");
 const Xoshiro128 = std.rand.Xoroshiro128;
 
 const seed = 6;
@@ -132,11 +134,12 @@ fn getInputOptionIndex(
     input_fbs: *std.io.FixedBufferStream([]u8),
     valid_option_indices: []const u8,
 ) !?usize {
-    const deal_with_crs = if (builtin.target.os.tag == .windows) true else false;
     try output_stream.writeAll("> ");
-    input_fbs.reset();
-    try streamAppropriately(deal_with_crs, input_stream, input_fbs.writer());
-    const selected_index = fmt.parseUnsigned(u8, input_fbs.getWritten(), 10) catch return null;
+    // input_fbs.reset();
+    _ = input_fbs;
+
+    const byte = try input_stream.readByte();
+    const selected_index = fmt.charToDigit(byte, 10) catch return null; //fmt.parseUnsigned(u8, byte, 10) catch return null;
     for (valid_option_indices) |option_index|
         if (option_index == selected_index)
             return selected_index;
@@ -296,6 +299,9 @@ pub fn main() !void {
     const stdin = stdin_file.reader();
     const tty = std.io.tty.detectConfig(stdout_file);
 
+    var console = Console.init(stdin_file.handle, stdout_file.handle);
+    defer console.deinit();
+
     var cards = Cards.init(arena);
     defer cards.deinit();
     try cards.readCSV(cards_csv_path);
@@ -324,33 +330,7 @@ pub fn main() !void {
     try player_state.deck.addCard(&cards, bash_id);
     try player_state.deck.addCard(&cards, ascenders_bane_id);
 
-    var poller = std.io.poll(, , )
-
-    var timer = try time.Timer.start();
-    var last_time = timer.read();
     while (true) { // Game loop
-        const now = timer.read();
-        if (now - last_time < time.ns_per_s / fps) {
-            time.sleep(time.ns_per_s / fps - (now - last_time));
-            last_time = timer.read();
-        }
-
-        const a = try stdin.readAll(&stdin_buf);
-        std.debug.print("{s}\n", .{stdin_buf[0..a]});
-
-        try clearScreen(stdout);
-        try moveCursor(stdout, 0, 0);
-        try drawHUD(stdout, &player_state, &game_state);
-        try drawMap(&map.location_nodes, tty, stdout);
-    }
-
-    while (true) { // Game loop
-        const now = timer.read();
-        if (now - last_time < time.ns_per_s / fps) {
-            time.sleep(time.ns_per_s / fps - (now - last_time));
-            last_time = timer.read();
-        }
-
         const location_type: Location.Type = if ((game_state.floor_number % @as(u8, Map.rows)) != 0)
             map.locationFromFloorAndColIndex(game_state.floor_number - 1, game_state.map_col_index).type
         else if (game_state.floor_number == @as(u8, 0)) .event else .boss;
@@ -442,6 +422,8 @@ pub fn main() !void {
             game_state.map_col_index = @as(u8, @truncate(selected_index));
             break;
         }
+
+        // try stdout.print("{c}\n", .{stdin.readByte() catch unreachable});
     }
 
     std.process.cleanExit();
