@@ -17,7 +17,10 @@ const seed = 6;
 const max_cards_in_hand = 10;
 const max_monsters_per_combat = 5;
 const cards_csv_path = "cards.csv";
-const fps = 2;
+
+const pane_row_offset = 3;
+const pane_cols = 32;
+const pane_rows = 18;
 
 // NOTE(caleb): Headless slay the spire will be broken into 2 distinct modes
 // 1) Nearly headless mode - mode that a human can play (used for debugging)
@@ -109,11 +112,29 @@ const PlayerState = struct {
     }
 };
 
+const GameMode = enum {
+    overlay, // i.e things like map, draw pile, discard pile...
+    nav,
+    combat,
+    event,
+    merchant,
+    rest,
+    treasure,
+};
+
+const Overlay = enum {
+    map,
+};
+
 const GameState = struct {
     floor_number: u8 = 0,
     map_col_index: u8 = 0,
     /// NOTE(caleb): Used to determine which encounter pool is used.
     encounters_this_act: u8 = 0,
+
+    mode: GameMode,
+    prev_mode: GameMode = undefined,
+    overlay: Overlay = undefined,
 };
 
 // Drawing functions ------------------------------------------------------------------------------
@@ -122,8 +143,20 @@ fn moveCursor(output_stream: anytype, row: usize, col: usize) !void {
     try output_stream.print("\x1b[{d};{d}H", .{ row, col });
 }
 
+fn clearPane(output_stream: anytype) !void {
+    var pane_row = @as(usize, 0);
+    while (pane_row < pane_rows) : (pane_row += 1) {
+        try moveCursor(output_stream, pane_row + pane_row_offset, 0);
+        try clearLine(output_stream);
+    }
+}
+
 fn clearScreen(output_stream: anytype) !void {
     try output_stream.writeAll("\x1b[2J");
+}
+
+fn clearLine(output_stream: anytype) !void {
+    try output_stream.writeAll("\x1b[2K");
 }
 
 /// Draws and input prompt. Returning a non-null value when user provides value
@@ -147,7 +180,6 @@ fn getInputOptionIndex(
 }
 
 fn drawHUD(output_stream: anytype, player_state: *PlayerState, game_state: *GameState) !void {
-    try moveCursor(output_stream, 0, 0);
     try output_stream.print("\x1b[1mCaleb\x1b[22m \x1b[2mThe Ironclad\x1b[22m HP: {d}/{d} gold: {d} pot,pot floor: {d} A20\n\r", .{
         player_state.hp,
         player_state.max_hp,
@@ -161,6 +193,7 @@ fn drawHUD(output_stream: anytype, player_state: *PlayerState, game_state: *Game
 }
 
 fn drawMap(map: []Location, tty: std.io.tty.Config, output_stream: anytype) !void {
+    try moveCursor(output_stream, pane_row_offset, 0);
     try output_stream.print("\tboss floor\n", .{});
     for (0..Map.rows) |row_index| {
         try output_stream.print("{d:2}. ", .{@as(u8, @intCast(Map.rows - row_index))});
@@ -179,107 +212,6 @@ fn drawMap(map: []Location, tty: std.io.tty.Config, output_stream: anytype) !voi
     try output_stream.writeAll("    ");
     for (0..Map.cols) |col_index| try output_stream.print("{d:1}.  ", .{col_index});
     try output_stream.writeByte('\n');
-}
-
-// asdf ------------------------------------------------------------------------------
-
-fn combat(
-    arena_ally: std.mem.Allocator,
-    cards: *Cards,
-    game_state: *GameState,
-    player_state: *PlayerState,
-    rand: std.rand.Random,
-    output_stream: anytype,
-    input_stream: anytype,
-    input_fbs: *std.io.FixedBufferStream([]u8),
-) !void {
-    var draw_pile = std.ArrayList(u8).init(arena_ally);
-    for (player_state.deck.cards.items) |card| try draw_pile.append(card.id);
-    rand.shuffle(u8, draw_pile.items);
-
-    var hand: [max_cards_in_hand]u8 = undefined;
-    for (&hand) |*card_index| card_index.* = 0;
-    var cards_in_hand: u8 = 0;
-
-    var discard_pile = std.ArrayList(u8).init(arena_ally);
-
-    var monsters_in_combat: [max_monsters_per_combat]Monster = undefined;
-    var n_monsters_in_combat = @as(u8, 0);
-
-    // TODO(caleb): other acts
-    var encounter =
-        if (game_state.encounters_this_act < 3)
-        @as(Act1Encounter, @enumFromInt(rand.weightedIndex(f32, act1_encounter_distribution[0..act1_easy_encounter_count])))
-    else
-        @as(Act1Encounter, @enumFromInt(rand.weightedIndex(f32, act1_encounter_distribution[act1_easy_encounter_count..]) +
-            act1_easy_encounter_count));
-    switch (encounter) {
-        .cultist => {
-            // 50-56 is the valid range for a cultist's hp
-            monsters_in_combat[0] = .{ .type = .cultist, .hp = 50 };
-            monsters_in_combat[0].hp += rand.uintLessThan(u16, 7);
-            n_monsters_in_combat += 1;
-        },
-        .jaw_worm => {},
-        .two_louses => {},
-        .small_slimes => {},
-        else => unreachable,
-    }
-
-    var turn_number: usize = 0;
-    while (true) : (turn_number += 1) {
-        while (cards_in_hand < 5) : (cards_in_hand += 1) {
-            if (draw_pile.items.len == 0) {
-                if (discard_pile.items.len == 0) break;
-                rand.shuffle(u8, discard_pile.items);
-                for (discard_pile.items, 0..) |card, card_index| try draw_pile.insert(card_index, card);
-            }
-            const card_index = draw_pile.pop();
-            hand[cards_in_hand] = card_index;
-        }
-        for (0..cards_in_hand) |card_index| try output_stream.print("{d: ^4}", .{card_index});
-        try output_stream.writeByte('\n');
-        for (hand[0..cards_in_hand]) |card_index|
-            try output_stream.print("{s},", .{cards.names.items[card_index][0..3]});
-        try output_stream.writeByte('\n');
-
-        // Player turn
-        while (true) {
-            var valid_option_indices: [max_cards_in_hand]u8 = undefined;
-            for (0..cards_in_hand) |card_index|
-                valid_option_indices[card_index] = @as(u8, @intCast(card_index));
-            const option_index = (try getInputOptionIndex(
-                output_stream,
-                input_stream,
-                input_fbs,
-                valid_option_indices[0..cards_in_hand],
-            )) orelse {
-                if (input_fbs.getWritten()[0] != 'e') // End turn
-                    continue;
-                break;
-            };
-            _ = option_index;
-
-            break;
-        }
-
-        // Discard cards in hand
-        for (0..cards_in_hand) |card_index|
-            try discard_pile.insert(card_index, hand[card_index]);
-        cards_in_hand = 0;
-
-        // Monster turn
-        for (monsters_in_combat[0..n_monsters_in_combat]) |monster| {
-            switch (monster.type) {
-                .cultist => {
-                    if (turn_number == 0) { // Incantation: gain strength every turn
-                        // TODO(caleb): cast ritual
-                    }
-                },
-                else => unreachable,
-            }
-        }
-    }
 }
 
 pub fn main() !void {
@@ -313,9 +245,15 @@ pub fn main() !void {
     };
     player_state.deck = Deck.init(arena);
     defer player_state.deck.deinit();
-    var game_state = GameState{};
+    var game_state = GameState{ .mode = .event };
     var map = Map{};
+    var frame_input = @as(u8, 0);
     map.generate(rand);
+
+    var cursor_row: usize = 0;
+    _ = cursor_row;
+    var cursor_col: usize = 0;
+    _ = cursor_col;
 
     // Starter relic
     player_state.addRelic(.burning_blood);
@@ -330,36 +268,173 @@ pub fn main() !void {
     try player_state.deck.addCard(&cards, bash_id);
     try player_state.deck.addCard(&cards, ascenders_bane_id);
 
-    while (true) { // Game loop
-        const location_type: Location.Type = if ((game_state.floor_number % @as(u8, Map.rows)) != 0)
-            map.locationFromFloorAndColIndex(game_state.floor_number - 1, game_state.map_col_index).type
-        else if (game_state.floor_number == @as(u8, 0)) .event else .boss;
-        switch (location_type) {
-            .monster, .elite, .boss => {
-                try combat(arena, &cards, &game_state, &player_state, rand, stdout, stdin, &stdin_fbs);
-            },
-            .event => {
-                if (game_state.floor_number == 0) { // Whale bonus
-                    // NOTE(caleb): Map is useful when choosing a whale bonus.
-                    try clearScreen(stdout);
-                    try moveCursor(stdout, 0, 0);
-                    try drawHUD(stdout, &player_state, &game_state);
-                    try drawMap(&map.location_nodes, tty, stdout);
+    try clearScreen(stdout);
+    while (true) {
 
-                    const option_strs = &[_][]const u8{
-                        "Max HP +8",
-                        "Enemies in the next three combat will have one health.",
+        // Update ------------------------------------------------------------------------------
+
+        switch (frame_input) { // Game mode agnostic inputs.
+            'm' => {
+                if (game_state.mode != .overlay) {
+                    game_state.prev_mode = game_state.mode;
+                    game_state.mode = .overlay;
+                } else game_state.mode = game_state.prev_mode;
+            },
+            else => {},
+        }
+
+        switch (game_state.mode) {
+            .overlay => {}, // NOTE(caleb): Nothing to update
+            .nav => {
+                var valid_col_indices: [Map.cols]u8 = undefined;
+                var valid_col_indices_count: u8 = 0;
+                if (game_state.floor_number % 15 != 0) {
+                    var at_least_col_dx = if (game_state.map_col_index > 0) @as(i8, -1) else @as(i8, 0);
+                    var less_than_col_dx = if (game_state.map_col_index < Map.cols - 1) @as(i8, 2) else @as(i8, 1);
+                    var d_col_index: i8 = at_least_col_dx;
+                    while (d_col_index < less_than_col_dx) : (d_col_index += 1) {
+                        if (map.locationFromFloorAndColIndex(game_state.floor_number - 1, game_state.map_col_index)
+                            .hasEdgeWithIndex(Map.floorIndexToMapRowIndex(game_state.floor_number) * Map.cols +
+                            @as(u8, @intCast(@as(i8, @intCast(game_state.map_col_index)) + d_col_index))))
+                        {
+                            valid_col_indices[valid_col_indices_count] =
+                                @as(u8, @intCast(@as(i8, @intCast(game_state.map_col_index)) + d_col_index));
+                            valid_col_indices_count += 1;
+                        }
+                    }
+                } else if (game_state.floor_number == 0) {
+                    for (0..Map.cols) |col_index| {
+                        if (map.location_nodes[(Map.rows - 1) * Map.cols + col_index].edgeCount() > 0) {
+                            valid_col_indices[valid_col_indices_count] = @as(u8, @truncate(col_index));
+                            valid_col_indices_count += 1;
+                        }
+                    }
+                } else { // Only option is boss fight
+                    valid_col_indices[valid_col_indices_count] = 0;
+                    valid_col_indices_count = 1;
+                }
+                while (true) {
+                    try stdout.print("{d}\n", .{valid_col_indices[0..valid_col_indices_count]});
+                    const selected_index = (try getInputOptionIndex(
+                        stdout,
+                        stdin,
+                        &stdin_fbs,
+                        valid_col_indices[0..valid_col_indices_count],
+                    )) orelse {
+                        try clearLine(stdout);
+                        try moveCursor(stdout, 20, 0);
+                        continue;
                     };
+                    game_state.floor_number += 1;
+                    game_state.map_col_index = @as(u8, @truncate(selected_index));
+                    break;
+                }
+
+                const location_type: Location.Type = if ((game_state.floor_number % @as(u8, Map.rows)) != 0)
+                    map.locationFromFloorAndColIndex(game_state.floor_number - 1, game_state.map_col_index).type
+                else if (game_state.floor_number == @as(u8, 0)) .event else .boss;
+                switch (location_type) {
+                    .monster, .elite, .boss => {},
+                    .event => game_state.mode = .event,
+                    .rest => unreachable,
+                    .merchant => unreachable,
+                    .treasure => unreachable,
+                }
+            },
+            .combat => {
+                var draw_pile = std.ArrayList(u8).init(arena);
+                for (player_state.deck.cards.items) |card| try draw_pile.append(card.id);
+                rand.shuffle(u8, draw_pile.items);
+
+                var hand: [max_cards_in_hand]u8 = undefined;
+                for (&hand) |*card_index| card_index.* = 0;
+                var cards_in_hand: u8 = 0;
+
+                var discard_pile = std.ArrayList(u8).init(arena);
+
+                var monsters_in_combat: [max_monsters_per_combat]Monster = undefined;
+                var n_monsters_in_combat = @as(u8, 0);
+
+                // TODO(caleb): other acts
+                var encounter =
+                    if (game_state.encounters_this_act < 3)
+                    @as(Act1Encounter, @enumFromInt(rand.weightedIndex(f32, act1_encounter_distribution[0..act1_easy_encounter_count])))
+                else
+                    @as(Act1Encounter, @enumFromInt(rand.weightedIndex(f32, act1_encounter_distribution[act1_easy_encounter_count..]) +
+                        act1_easy_encounter_count));
+                switch (encounter) {
+                    .cultist => {
+                        // 50-56 is the valid range for a cultist's hp
+                        monsters_in_combat[0] = .{ .type = .cultist, .hp = 50 };
+                        monsters_in_combat[0].hp += rand.uintLessThan(u16, 7);
+                        n_monsters_in_combat += 1;
+                    },
+                    .jaw_worm => {},
+                    .two_louses => {},
+                    .small_slimes => {},
+                    else => unreachable,
+                }
+
+                var turn_number: usize = 0;
+                while (true) : (turn_number += 1) {
+                    while (cards_in_hand < 5) : (cards_in_hand += 1) {
+                        if (draw_pile.items.len == 0) {
+                            if (discard_pile.items.len == 0) break;
+                            rand.shuffle(u8, discard_pile.items);
+                            for (discard_pile.items, 0..) |card, card_index| try draw_pile.insert(card_index, card);
+                        }
+                        const card_index = draw_pile.pop();
+                        hand[cards_in_hand] = card_index;
+                    }
+                    for (0..cards_in_hand) |card_index| try stdout.print("{d: ^4}", .{card_index});
+                    try stdout.writeByte('\n');
+                    for (hand[0..cards_in_hand]) |card_index|
+                        try stdout.print("{s},", .{cards.names.items[card_index][0..3]});
+                    try stdout.writeByte('\n');
+
+                    // Player turn
                     while (true) {
-                        for (option_strs, 0..) |option_str, option_str_index|
-                            try stdout.print("{d}.) {s}\n", .{ option_str_index, option_str });
+                        var valid_option_indices: [max_cards_in_hand]u8 = undefined;
+                        for (0..cards_in_hand) |card_index|
+                            valid_option_indices[card_index] = @as(u8, @intCast(card_index));
                         const option_index = (try getInputOptionIndex(
                             stdout,
                             stdin,
                             &stdin_fbs,
-                            &[_]u8{ 0, 1 },
-                        )) orelse continue;
-                        const whale_bonus = @as(WhaleBonus, @enumFromInt(option_index));
+                            valid_option_indices[0..cards_in_hand],
+                        )) orelse {
+                            if (stdin_fbs.getWritten().len > 0 and stdin_fbs.getWritten()[0] != 'e') // End turn
+                                continue;
+                            break;
+                        };
+                        _ = option_index;
+
+                        break;
+                    }
+
+                    // Discard cards in hand
+                    for (0..cards_in_hand) |card_index|
+                        try discard_pile.insert(card_index, hand[card_index]);
+                    cards_in_hand = 0;
+
+                    // Monster turn
+                    for (monsters_in_combat[0..n_monsters_in_combat]) |monster| {
+                        switch (monster.type) {
+                            .cultist => {
+                                if (turn_number == 0) { // Incantation: gain strength every turn
+                                    // TODO(caleb): cast ritual
+                                }
+                            },
+                            else => unreachable,
+                        }
+                    }
+                }
+            },
+            .event => {
+                if (game_state.floor_number == 0) { // Whale bonus
+                    const option_index: ?u8 = fmt.charToDigit(frame_input, 10) catch null;
+                    if (option_index != null) {
+                        const whale_bonus = @as(WhaleBonus, @enumFromInt(option_index.?));
                         switch (whale_bonus) {
                             .max_hp => {
                                 player_state.max_hp += 8;
@@ -368,62 +443,50 @@ pub fn main() !void {
                             .lament => player_state.addRelic(.neows_lament),
                             else => unreachable,
                         }
-                        break;
+                        game_state.mode = .nav;
                     }
                 } else unreachable;
             },
-            .rest => unreachable,
-            .merchant => unreachable,
-            .treasure => unreachable,
+            else => unreachable,
         }
 
-        // Finished doing location stuff decide where to go now!
-        try clearScreen(stdout);
+        // Draw ------------------------------------------------------------------------------
+
+        // HUD (2 rows)
+        // display (32 col x 16 row)
+        // input options
+
         try moveCursor(stdout, 0, 0);
+        try clearLine(stdout);
         try drawHUD(stdout, &player_state, &game_state);
-        try drawMap(&map.location_nodes, tty, stdout);
 
-        var valid_col_indices: [Map.cols]u8 = undefined;
-        var valid_col_indices_count: u8 = 0;
-        if (game_state.floor_number % 15 != 0) {
-            var at_least_col_dx = if (game_state.map_col_index > 0) @as(i8, -1) else @as(i8, 0);
-            var less_than_col_dx = if (game_state.map_col_index < Map.cols - 1) @as(i8, 2) else @as(i8, 1);
-            var d_col_index: i8 = at_least_col_dx;
-            while (d_col_index < less_than_col_dx) : (d_col_index += 1) {
-                if (map.locationFromFloorAndColIndex(game_state.floor_number - 1, game_state.map_col_index)
-                    .hasEdgeWithIndex(Map.floorIndexToMapRowIndex(game_state.floor_number) * Map.cols +
-                    @as(u8, @intCast(@as(i8, @intCast(game_state.map_col_index)) + d_col_index))))
-                {
-                    valid_col_indices[valid_col_indices_count] =
-                        @as(u8, @intCast(@as(i8, @intCast(game_state.map_col_index)) + d_col_index));
-                    valid_col_indices_count += 1;
+        switch (game_state.mode) {
+            .overlay => {
+                switch (game_state.overlay) {
+                    .map => {
+                        try clearPane(stdout);
+                        try drawMap(&map.location_nodes, tty, stdout);
+                    },
                 }
-            }
-        } else if (game_state.floor_number == 0) {
-            for (0..Map.cols) |col_index| {
-                if (map.location_nodes[(Map.rows - 1) * Map.cols + col_index].edgeCount() > 0) {
-                    valid_col_indices[valid_col_indices_count] = @as(u8, @truncate(col_index));
-                    valid_col_indices_count += 1;
-                }
-            }
-        } else { // Only option is boss fight
-            valid_col_indices[valid_col_indices_count] = 0;
-            valid_col_indices_count = 1;
-        }
-        while (true) {
-            try stdout.print("{d}\n", .{valid_col_indices[0..valid_col_indices_count]});
-            const selected_index = (try getInputOptionIndex(
-                stdout,
-                stdin,
-                &stdin_fbs,
-                valid_col_indices[0..valid_col_indices_count],
-            )) orelse continue;
-            game_state.floor_number += 1;
-            game_state.map_col_index = @as(u8, @truncate(selected_index));
-            break;
+            },
+            .event => {
+                if (game_state.floor_number == 0) { // Whale bonus
+
+                    try clearPane(stdout);
+                    try moveCursor(stdout, pane_row_offset, 0);
+                    const option_strs = &[_][]const u8{
+                        "Max HP +8",
+                        "Enemies in the next three combat will have one health.",
+                    };
+                    for (option_strs, 0..) |option_str, option_str_index|
+                        try stdout.print("{d}.) {s}\n", .{ option_str_index, option_str });
+                } else unreachable;
+            },
+            .nav => {},
+            else => unreachable,
         }
 
-        // try stdout.print("{c}\n", .{stdin.readByte() catch unreachable});
+        frame_input = try stdin.readByte();
     }
 
     std.process.cleanExit();
