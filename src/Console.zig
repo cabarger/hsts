@@ -23,6 +23,13 @@ pub fn init(console_stdin_handle: os.fd_t, console_stdout_handle: os.fd_t) Self 
     return result;
 }
 
+pub fn maxRowCol(self: *Self, rows: *usize, cols: *usize) void {
+    var sbi: c.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+    if (c.GetConsoleScreenBufferInfo(self.stdout_handle, &sbi) != 1) unreachable;
+    rows.* = @intCast(sbi.dwSize.Y);
+    cols.* = @intCast(sbi.dwSize.X);
+}
+
 pub fn deinit(self: *Self) void {
     _ = c.SetConsoleMode(self.stdout_handle, self.dw_stdout_old_mode);
     _ = c.SetConsoleMode(self.stdin_handle, self.dw_stdin_old_mode);

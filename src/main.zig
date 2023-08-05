@@ -6,6 +6,7 @@ const debug = std.debug;
 const time = std.time;
 const windows = std.os.windows;
 
+const art = @import("art.zig");
 const Deck = @import("Deck.zig");
 const Cards = @import("Cards.zig");
 const Map = @import("Map.zig");
@@ -19,8 +20,10 @@ const max_monsters_per_combat = 5;
 const cards_csv_path = "cards.csv";
 
 const pane_row_offset = 3;
-const pane_cols = 32;
-const pane_rows = 18;
+var pane_rows = @as(usize, 0);
+var pane_cols = @as(usize, 0);
+
+const portrait_padding = 2;
 
 // NOTE(caleb): Headless slay the spire will be broken into 2 distinct modes
 // 1) Nearly headless mode - mode that a human can play (used for debugging)
@@ -40,6 +43,7 @@ const Monster = struct {
     };
     type: Type,
     hp: u16,
+    max_hp: u16,
 };
 
 const act1_easy_encounter_count = 4;
@@ -109,6 +113,15 @@ const Overlay = enum {
     map,
 };
 
+const CardHandle = struct {
+    const DeckType = enum {
+        perm,
+        tmp,
+    };
+    deck_type: DeckType,
+    index: u8,
+};
+
 const GameState = struct {
     const Self = @This();
 
@@ -118,23 +131,25 @@ const GameState = struct {
     encounters_this_act: u8 = 0,
     turn_number: u8 = 0,
     did_start_of_turn_stuff: bool = false,
-    hand: [max_cards_in_hand]u8 = undefined,
+    hand: [max_cards_in_hand]CardHandle = undefined,
     cards_in_hand: u8 = 0,
-    draw_pile: std.ArrayList(u8) = undefined,
-    discard_pile: std.ArrayList(u8) = undefined,
+    draw_pile: std.ArrayList(CardHandle) = undefined,
+    discard_pile: std.ArrayList(CardHandle) = undefined,
     monsters_in_combat: [max_monsters_per_combat]Monster = undefined,
     n_monsters_in_combat: u8 = 0,
     mode: GameMode,
     prev_mode: GameMode = undefined,
     overlay: Overlay = undefined,
-    hp: u8,
-    max_hp: u8,
+    hp: u16,
+    max_hp: u16,
     gold: u16,
     /// NOTE(caleb): 2 for A20 potion cap. Another 2 if potion belt relic is acquired.
     potions: [2 + 2]u8 = undefined,
     relic_count: u8 = 0,
     relics: [100]Relic = undefined,
+
     deck: Deck = undefined,
+    tmp_deck: Deck = undefined,
 
     pub fn addRelic(self: *Self, relic: Relic) void {
         debug.assert(self.relic_count + 1 <= self.relics.len);
@@ -143,27 +158,30 @@ const GameState = struct {
     }
 
     pub fn initCombat(self: *Self, rng: std.rand.Random) !void {
-        for (self.deck.cards.items) |card| try self.draw_pile.append(card.id);
-        rng.shuffle(u8, self.draw_pile.items);
-        for (&self.hand) |*card_index| card_index.* = 0;
+        for (0..self.deck.cards.items.len) |card_index| try self.draw_pile.append(CardHandle{
+            .index = @intCast(card_index),
+            .deck_type = .perm,
+        });
+        rng.shuffle(CardHandle, self.draw_pile.items);
+        for (&self.hand) |*card_handle| card_handle.* = .{ .index = 0, .deck_type = undefined };
 
         // TODO(caleb): other acts
-        var encounter =
+        var encounter: Act1Encounter =
             if (self.encounters_this_act < 3)
-            @as(Act1Encounter, @enumFromInt(rng.weightedIndex(f32, act1_encounter_distribution[0..act1_easy_encounter_count])))
+            @enumFromInt(rng.weightedIndex(f32, act1_encounter_distribution[0..act1_easy_encounter_count]))
         else
-            @as(Act1Encounter, @enumFromInt(rng.weightedIndex(f32, act1_encounter_distribution[act1_easy_encounter_count..]) +
-                act1_easy_encounter_count));
+            @enumFromInt(rng.weightedIndex(f32, act1_encounter_distribution[act1_easy_encounter_count..]) +
+                act1_easy_encounter_count);
         switch (encounter) {
-            .cultist => {
+            .cultist, .jaw_worm, .two_louses, .small_slimes => {
                 // 50-56 is the valid range for a cultist's hp
-                self.monsters_in_combat[0] = .{ .type = .cultist, .hp = 50 };
-                self.monsters_in_combat[0].hp += rng.uintLessThan(u16, 7);
+                self.monsters_in_combat[0] = .{ .type = .cultist, .hp = 50, .max_hp = 50 };
+                // self.monsters_in_combat[0].hp += rng.uintLessThan(u16, 7);
                 self.n_monsters_in_combat += 1;
             },
-            .jaw_worm => {},
-            .two_louses => {},
-            .small_slimes => {},
+            // .jaw_worm => unreachable,
+            // .two_louses => unreachable,
+            // .small_slimes => unreachable,
             else => unreachable,
         }
     }
@@ -172,12 +190,11 @@ const GameState = struct {
         while (self.cards_in_hand < 5) : (self.cards_in_hand += 1) {
             if (self.draw_pile.items.len == 0) {
                 if (self.discard_pile.items.len == 0) break;
-                rng.shuffle(u8, self.discard_pile.items);
-                for (self.discard_pile.items, 0..) |card, card_index|
-                    try self.draw_pile.insert(card_index, card);
+                rng.shuffle(CardHandle, self.discard_pile.items);
+                for (self.discard_pile.items, 0..) |card_handle, card_index|
+                    try self.draw_pile.insert(card_index, card_handle);
             }
-            const card_index = self.draw_pile.pop();
-            self.hand[self.cards_in_hand] = card_index;
+            self.hand[self.cards_in_hand] = self.draw_pile.pop();
         }
     }
 };
@@ -237,15 +254,19 @@ fn drawHUD(output_stream: anytype, gs: *GameState) !void {
     try output_stream.writeAll("\r\n");
 }
 
-fn drawMap(map: []Location, tty: std.io.tty.Config, output_stream: anytype) !void {
+fn drawMap(gs: *GameState, map: []Location, tty: std.io.tty.Config, output_stream: anytype) !void {
     try moveCursor(output_stream, pane_row_offset, 0);
     try output_stream.print("\tboss floor\n", .{});
     for (0..Map.rows) |row_index| {
+        try tty.setColor(output_stream, .reset);
         try output_stream.print("{d:2}. ", .{@as(u8, @intCast(Map.rows - row_index))});
         for (0..Map.cols) |col_index| {
-            try tty.setColor(output_stream, @as(std.io.tty.Color, @enumFromInt(@intFromEnum(std.io.tty.Color.red) +
-                map[row_index * Map.cols + col_index].path_generation_index)));
+            const location_color: std.io.tty.Color = @enumFromInt(@intFromEnum(std.io.tty.Color.red) +
+                map[row_index * Map.cols + col_index].path_generation_index);
+            try tty.setColor(output_stream, location_color);
             if (map[row_index * Map.cols + col_index].edgeCount() > 0) {
+                if ((col_index == gs.map_col_index) and (Map.rows - row_index == gs.floor_number))
+                    try tty.setColor(output_stream, .bold);
                 try output_stream.print("{s}  ", .{@tagName(map[row_index * Map.cols + col_index].type)[0..2]});
             } else {
                 try output_stream.writeAll("    ");
@@ -291,9 +312,10 @@ pub fn main() !void {
         .gold = 99,
         .mode = .event,
     };
-    gs.draw_pile = std.ArrayList(u8).init(arena);
-    gs.discard_pile = std.ArrayList(u8).init(arena);
+    gs.draw_pile = std.ArrayList(CardHandle).init(arena);
+    gs.discard_pile = std.ArrayList(CardHandle).init(arena);
     gs.deck = Deck.init(arena);
+    gs.tmp_deck = Deck.init(arena);
 
     var map = Map{};
     map.generate(rng);
@@ -312,6 +334,14 @@ pub fn main() !void {
     try gs.deck.addCard(&cards, ascenders_bane_id);
 
     try clearScreen(stdout);
+
+    var max_rows: usize = undefined;
+    var max_cols: usize = undefined;
+    console.maxRowCol(&max_rows, &max_cols); // NOTE(caleb): ReadConsoleInput and check for resize event?
+    debug.assert(max_cols >= (art.portrait_cols + portrait_padding) * 6);
+    pane_rows = @as(usize, @intFromFloat(0.75 * @as(f32, @floatFromInt(max_rows))));
+    pane_cols = max_cols;
+
     while (true) {
 
         // Update ------------------------------------------------------------------------------
@@ -450,7 +480,7 @@ pub fn main() !void {
                 switch (gs.overlay) {
                     .map => {
                         try clearPane(stdout);
-                        try drawMap(&map.location_nodes, tty, stdout);
+                        try drawMap(&gs, &map.location_nodes, tty, stdout);
                     },
                 }
             },
@@ -469,17 +499,66 @@ pub fn main() !void {
             .combat => {
                 try clearPane(stdout);
                 try moveCursor(stdout, pane_row_offset, 0);
-                for (0..gs.cards_in_hand) |card_index| try stdout.print("{d: ^4}", .{card_index});
+
+                // Draw player
+
+                try stdout.writeAll(art.ironclad); // TODO(caleb): Do this on a character basis
+
+                try stdout.writeAll("\n\n");
+                var num_bars_to_color_red: usize = @intFromFloat(@as(f32, @floatFromInt(gs.hp)) / @as(f32, @floatFromInt(gs.max_hp)) * @as(f32, art.portrait_cols));
+                for (0..art.portrait_cols) |hp_bar_col_index| {
+                    if (hp_bar_col_index <= num_bars_to_color_red) {
+                        try tty.setColor(stdout, .red);
+                    } else try tty.setColor(stdout, .white);
+                    try stdout.writeAll("█");
+                }
+                try tty.setColor(stdout, .reset);
+
+                // Draw enemies
+                for (gs.monsters_in_combat[0..gs.n_monsters_in_combat], 0..) |monster, monster_index| {
+                    var portrait_iter = mem.splitSequence(u8, art.cultist, "\n");
+                    var portrait_line: ?[]const u8 = portrait_iter.first();
+                    const col_offset = (monster_index + 1) * (art.portrait_cols + portrait_padding);
+                    for (0..art.portrait_rows) |portrait_row_index| {
+                        try moveCursor(stdout, pane_row_offset + portrait_row_index, col_offset);
+                        try stdout.writeAll(portrait_line.?);
+                        portrait_line = portrait_iter.next();
+                    }
+                    try moveCursor(stdout, pane_row_offset + art.portrait_rows + 1, col_offset);
+                    num_bars_to_color_red = @intFromFloat(@as(f32, @floatFromInt(monster.max_hp)) / @as(f32, @floatFromInt(monster.max_hp)) * @as(f32, art.portrait_cols));
+                    for (0..art.portrait_cols) |hp_bar_col_index| {
+                        if (hp_bar_col_index <= num_bars_to_color_red) {
+                            try tty.setColor(stdout, .red);
+                        } else try tty.setColor(stdout, .white);
+                        try stdout.writeAll("█");
+                    }
+                    try tty.setColor(stdout, .reset);
+                }
+
+                // for (0..gs.cards_in_hand) |card_index| try stdout.print("{d: ^4}", .{card_index});
                 try stdout.writeByte('\n');
-                for (gs.hand[0..gs.cards_in_hand]) |card_index|
-                    try stdout.print("{s},", .{cards.names.items[card_index][0..3]});
-                try stdout.writeByte('\n');
+                for (gs.hand[0..1]) |card_handle| {
+                    try stdout.print(
+                        \\------
+                        \\|{s}|
+                        \\|----|
+                        \\|{s}|
+                        \\|{d}   |
+                        \\------
+                    , .{
+                        if (card_handle.deck_type == .perm) cards.names.items[gs.deck.cards.items[card_handle.index].id][0..4] else cards.names.items[gs.tmp_deck.cards.items[card_handle.index].id][0..4],
+                        if (card_handle.deck_type == .perm) @tagName(@as(Cards.Type, @enumFromInt(gs.deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)])))[0..4] else @tagName(@as(Cards.Type, @enumFromInt(gs.tmp_deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)])))[0..4],
+                        if (card_handle.deck_type == .perm) gs.deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.cost)] else gs.tmp_deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.cost)],
+                    });
+                }
+
+                try moveCursor(stdout, pane_rows, pane_cols); // BANISH THE CURSOR
 
                 // TODO(caleb): Draw enemy move intent.
             },
             .nav => {
                 try clearPane(stdout);
-                try drawMap(&map.location_nodes, tty, stdout);
+                try drawMap(&gs, &map.location_nodes, tty, stdout);
 
                 var valid_col_indices: [Map.cols]u8 = undefined;
                 var valid_col_indices_count: u8 = 0;

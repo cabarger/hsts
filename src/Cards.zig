@@ -17,6 +17,7 @@ pub const WTFDoDim = enum(usize) {
     block,
     vulnerable,
     ritual,
+    cost,
 
     len,
 };
@@ -79,20 +80,25 @@ pub fn readCSV(self: *Self, cards_csv_path: []const u8) !void {
         var card_vals = std.mem.splitSequence(u8, line, ",");
 
         const name = card_vals.first();
+        const card_type = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const damage = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const d_upgrade_damage = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const block = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const d_upgrade_block = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const vulnerable = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const d_upgrade_vulnerable = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
+        const cost = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
+        //TODO(caleb): d_upgrade_cost
 
         const duped_name = try self.ally.dupe(u8, name);
         try self.names.append(duped_name);
 
         var wtf_do = std.mem.zeroes(@Vector(@intFromEnum(WTFDoDim.len), u8));
+        wtf_do[@intFromEnum(WTFDoDim.card_type)] = card_type;
         wtf_do[@intFromEnum(WTFDoDim.damage)] = damage;
         wtf_do[@intFromEnum(WTFDoDim.block)] = block;
         wtf_do[@intFromEnum(WTFDoDim.vulnerable)] = vulnerable;
+        wtf_do[@intFromEnum(WTFDoDim.cost)] = cost;
         try self.wtf_do.append(wtf_do);
 
         var d_upgrade_wtf_do = std.mem.zeroes(@Vector(@intFromEnum(WTFDoDim.len), u8));
