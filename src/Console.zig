@@ -17,10 +17,17 @@ pub fn init(console_stdin_handle: os.fd_t, console_stdout_handle: os.fd_t) Self 
     _ = c.GetConsoleMode(console_stdout_handle, &result.dw_stdout_old_mode);
     _ = c.GetConsoleMode(console_stdin_handle, &result.dw_stdin_old_mode);
     _ = c.SetConsoleMode(console_stdout_handle, result.dw_stdout_old_mode | ~@as(windows.DWORD, c.ENABLE_VIRTUAL_TERMINAL_PROCESSING));
-    _ = c.SetConsoleOutputCP(c.CP_UTF8);
     _ = c.SetConsoleMode(console_stdin_handle, result.dw_stdin_old_mode & ~@as(windows.DWORD, c.ENABLE_LINE_INPUT | c.ENABLE_ECHO_INPUT));
+    _ = c.SetConsoleOutputCP(c.CP_UTF8);
 
     return result;
+}
+
+pub fn cursorRowCol(self: *Self, row: *usize, col: *usize) void {
+    var sbi: c.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+    if (c.GetConsoleScreenBufferInfo(self.stdout_handle, &sbi) != 1) unreachable;
+    row.* = @intCast(sbi.dwCursorPosition.Y);
+    col.* = @intCast(sbi.dwCursorPosition.X);
 }
 
 pub fn maxRowCol(self: *Self, rows: *usize, cols: *usize) void {

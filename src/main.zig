@@ -131,15 +131,20 @@ const GameState = struct {
     encounters_this_act: u8 = 0,
     turn_number: u8 = 0,
     did_start_of_turn_stuff: bool = false,
+    selected_card_index: ?u8 = null,
+    target_index: ?u8 = null,
     hand: [max_cards_in_hand]CardHandle = undefined,
     cards_in_hand: u8 = 0,
     draw_pile: std.ArrayList(CardHandle) = undefined,
     discard_pile: std.ArrayList(CardHandle) = undefined,
+    exahust_pile: std.ArrayList(CardHandle) = undefined,
     monsters_in_combat: [max_monsters_per_combat]Monster = undefined,
     n_monsters_in_combat: u8 = 0,
     mode: GameMode,
     prev_mode: GameMode = undefined,
     overlay: Overlay = undefined,
+    energy: u8 = 0,
+    base_energy: u8 = 3,
     hp: u16,
     max_hp: u16,
     gold: u16,
@@ -187,15 +192,44 @@ const GameState = struct {
     }
 
     pub fn drawCards(self: *Self, rng: std.rand.Random) !void {
-        while (self.cards_in_hand < 5) : (self.cards_in_hand += 1) {
+        const base_card_draw = 5;
+        var cards_drawn_this_turn: u8 = 0;
+        while (cards_drawn_this_turn < base_card_draw and self.cards_in_hand + 1 < max_cards_in_hand) {
             if (self.draw_pile.items.len == 0) {
                 if (self.discard_pile.items.len == 0) break;
                 rng.shuffle(CardHandle, self.discard_pile.items);
                 for (self.discard_pile.items, 0..) |card_handle, card_index|
                     try self.draw_pile.insert(card_index, card_handle);
+                self.discard_pile.clearRetainingCapacity();
             }
             self.hand[self.cards_in_hand] = self.draw_pile.pop();
+
+            self.cards_in_hand += 1;
+            cards_drawn_this_turn += 1;
         }
+    }
+
+    pub fn cardFromHandle(self: *Self, card_handle: CardHandle) Cards.Card {
+        const card: Cards.Card = if (card_handle.deck_type == .perm)
+            self.deck.cards.items[card_handle.index]
+        else
+            self.tmp_deck.cards.items[card_handle.index];
+        return card;
+    }
+
+    pub fn cardTypeFromHandle(self: *Self, card_handle: CardHandle) Cards.Type {
+        return @as(Cards.Type, @enumFromInt(self.cardFromHandle(card_handle).wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)]));
+    }
+
+    pub fn isPlayableCard(self: *Self, card_handle: CardHandle) bool {
+        const card_type = self.cardTypeFromHandle(card_handle);
+        if (card_type != .status and card_type != .curse) // TODO(caleb): relics that allow you to play these cards.
+            return true;
+        return false;
+    }
+
+    pub fn endTurn(self: *Self) void {
+        _ = self;
     }
 };
 
@@ -314,6 +348,7 @@ pub fn main() !void {
     };
     gs.draw_pile = std.ArrayList(CardHandle).init(arena);
     gs.discard_pile = std.ArrayList(CardHandle).init(arena);
+    gs.exahust_pile = std.ArrayList(CardHandle).init(arena);
     gs.deck = Deck.init(arena);
     gs.tmp_deck = Deck.init(arena);
 
@@ -409,6 +444,7 @@ pub fn main() !void {
                                 gs.mode = .combat;
                                 try gs.initCombat(rng);
 
+                                frame_input = 0;
                                 continue; // NOTE(caleb): goto combat
                             },
                             .event => gs.mode = .event,
@@ -427,8 +463,39 @@ pub fn main() !void {
                 }
                 const option_index: ?u8 = fmt.charToDigit(frame_input, 10) catch null;
                 if (option_index != null) {
-                    // TODO(caleb): Do something
+                    if (option_index.? < gs.cards_in_hand) {
+                        // If a card is selected already attempt to play the card
+                        if (gs.selected_card_index != null and option_index.? == gs.selected_card_index.?) {
+                            // TODO(caleb): Energy....
+                            const card_to_play = gs.hand[option_index.?];
+
+                            if (gs.isPlayableCard(gs.hand[option_index.?])) {
+                                const card_type = gs.cardTypeFromHandle(gs.hand[option_index.?]);
+
+                                // NOTE(caleb): Need to validate
+                                if (card_type == .attack and gs.target_index == null) { // NOTE(caleb): Attacks can be ambigous so a target will need to be supplied.
+                                    frame_input = 0;
+                                    continue;
+                                }
+
+                                // Clear selected card
+                                gs.selected_card_index = null;
+
+                                // Remove the card from hand
+                                gs.cards_in_hand -= 1;
+                                if (gs.cards_in_hand > 0)
+                                    gs.hand[option_index.?] = gs.hand[gs.cards_in_hand];
+
+                                // TODO(caleb): discard_pile or exhaust_pile
+                                try gs.discard_pile.append(gs.hand[option_index.?]);
+                            }
+
+                            _ = card_to_play;
+                        } else gs.selected_card_index = option_index.?; // Select the card
+                    }
                 } else if (frame_input == 'e') {
+                    // End turn stuff
+
                     // Discard cards in hand
                     for (0..gs.cards_in_hand) |card_index|
                         try gs.discard_pile.insert(card_index, gs.hand[card_index]);
@@ -447,6 +514,9 @@ pub fn main() !void {
                     }
                     gs.did_start_of_turn_stuff = false; // End turn
                     gs.turn_number += 1;
+
+                    frame_input = 0;
+                    continue;
                 }
             },
             .event => {
@@ -500,10 +570,8 @@ pub fn main() !void {
                 try clearPane(stdout);
                 try moveCursor(stdout, pane_row_offset, 0);
 
-                // Draw player
-
+                // Character
                 try stdout.writeAll(art.ironclad); // TODO(caleb): Do this on a character basis
-
                 try stdout.writeAll("\n\n");
                 var num_bars_to_color_red: usize = @intFromFloat(@as(f32, @floatFromInt(gs.hp)) / @as(f32, @floatFromInt(gs.max_hp)) * @as(f32, art.portrait_cols));
                 for (0..art.portrait_cols) |hp_bar_col_index| {
@@ -514,7 +582,8 @@ pub fn main() !void {
                 }
                 try tty.setColor(stdout, .reset);
 
-                // Draw enemies
+                // Enemies
+                // TODO(caleb): Draw enemy move intent.
                 for (gs.monsters_in_combat[0..gs.n_monsters_in_combat], 0..) |monster, monster_index| {
                     var portrait_iter = mem.splitSequence(u8, art.cultist, "\n");
                     var portrait_line: ?[]const u8 = portrait_iter.first();
@@ -535,26 +604,46 @@ pub fn main() !void {
                     try tty.setColor(stdout, .reset);
                 }
 
-                // for (0..gs.cards_in_hand) |card_index| try stdout.print("{d: ^4}", .{card_index});
-                try stdout.writeByte('\n');
-                for (gs.hand[0..1]) |card_handle| {
-                    try stdout.print(
-                        \\------
-                        \\|{s}|
-                        \\|----|
-                        \\|{s}|
-                        \\|{d}   |
-                        \\------
-                    , .{
-                        if (card_handle.deck_type == .perm) cards.names.items[gs.deck.cards.items[card_handle.index].id][0..4] else cards.names.items[gs.tmp_deck.cards.items[card_handle.index].id][0..4],
-                        if (card_handle.deck_type == .perm) @tagName(@as(Cards.Type, @enumFromInt(gs.deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)])))[0..4] else @tagName(@as(Cards.Type, @enumFromInt(gs.tmp_deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)])))[0..4],
-                        if (card_handle.deck_type == .perm) gs.deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.cost)] else gs.tmp_deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.cost)],
-                    });
+                // Energy
+                try stdout.print("\n\n{d}/{d}\n\n\n", .{ gs.energy, gs.base_energy });
+
+                // Cards
+                var cursor_row: usize = undefined;
+                var cursor_col: usize = undefined;
+                console.cursorRowCol(&cursor_row, &cursor_col); // NOTE(caleb): Don't care what cursor_col is
+                cursor_col = 1;
+                try moveCursor(stdout, cursor_row, cursor_col);
+                for (gs.hand[0..gs.cards_in_hand], 0..) |card_handle, card_index| {
+                    var row_offset: isize = 0;
+                    if (gs.selected_card_index != null and card_index == gs.selected_card_index.?)
+                        row_offset -= 1;
+                    try moveCursor(stdout, @as(usize, @intCast(@as(isize, @intCast(cursor_row)) + row_offset)), cursor_col);
+                    try stdout.writeAll("------");
+                    row_offset += 1;
+                    try moveCursor(stdout, @as(usize, @intCast(@as(isize, @intCast(cursor_row)) + row_offset)), cursor_col);
+                    try stdout.print("|{s}|", .{if (card_handle.deck_type == .perm) cards.names.items[gs.deck.cards.items[card_handle.index].id][0..4] else cards.names.items[gs.tmp_deck.cards.items[card_handle.index].id][0..4]});
+                    row_offset += 1;
+                    try moveCursor(stdout, @as(usize, @intCast(@as(isize, @intCast(cursor_row)) + row_offset)), cursor_col);
+                    try stdout.writeAll("|----|");
+                    row_offset += 1;
+                    try moveCursor(stdout, @as(usize, @intCast(@as(isize, @intCast(cursor_row)) + row_offset)), cursor_col);
+                    try stdout.print("|{s}|", .{if (card_handle.deck_type == .perm) @tagName(@as(Cards.Type, @enumFromInt(gs.deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)])))[0..4] else @tagName(@as(Cards.Type, @enumFromInt(gs.tmp_deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)])))[0..4]});
+                    row_offset += 1;
+                    try moveCursor(stdout, @as(usize, @intCast(@as(isize, @intCast(cursor_row)) + row_offset)), cursor_col);
+                    try stdout.print("|{d}   |", .{if (card_handle.deck_type == .perm) gs.deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.cost)] else gs.tmp_deck.cards.items[card_handle.index].wtf_do[@intFromEnum(Cards.WTFDoDim.cost)]});
+                    row_offset += 1;
+                    try moveCursor(stdout, @as(usize, @intCast(@as(isize, @intCast(cursor_row)) + row_offset)), cursor_col);
+                    try stdout.writeAll("------");
+                    row_offset += 1;
+                    try moveCursor(stdout, @as(usize, @intCast(@as(isize, @intCast(cursor_row)) + row_offset)), cursor_col);
+                    try stdout.print("{d: ^6}\n", .{card_index});
+
+                    cursor_col += 8;
+                    try moveCursor(stdout, cursor_row, cursor_col);
                 }
 
                 try moveCursor(stdout, pane_rows, pane_cols); // BANISH THE CURSOR
 
-                // TODO(caleb): Draw enemy move intent.
             },
             .nav => {
                 try clearPane(stdout);
