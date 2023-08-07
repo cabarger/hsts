@@ -1,4 +1,4 @@
 # hsts
 Headless slay the spire.
 
-[screenshot](./screenshot.png)
+![screenshot](./screenshot.png)
