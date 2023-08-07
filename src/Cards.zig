@@ -18,13 +18,18 @@ pub const WTFDoDim = enum(usize) {
     vulnerable,
     ritual,
     cost,
+    aoe,
 
-    len,
+    len, // !!Nothing bellow this line!!
 };
 
 pub const Card = struct {
     id: u8,
     wtf_do: @Vector(@intFromEnum(WTFDoDim.len), u8),
+
+    pub fn dim(self: *const Card, d: WTFDoDim) u8 {
+        return self.wtf_do[@intFromEnum(d)];
+    }
 };
 
 ally: std.mem.Allocator,
@@ -88,7 +93,8 @@ pub fn readCSV(self: *Self, cards_csv_path: []const u8) !void {
         const vulnerable = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const d_upgrade_vulnerable = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
         const cost = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
-        //TODO(caleb): d_upgrade_cost
+        const d_upgrade_cost = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
+        const aoe = try fmt.parseUnsigned(u8, card_vals.next() orelse unreachable, 10);
 
         const duped_name = try self.ally.dupe(u8, name);
         try self.names.append(duped_name);
@@ -99,12 +105,14 @@ pub fn readCSV(self: *Self, cards_csv_path: []const u8) !void {
         wtf_do[@intFromEnum(WTFDoDim.block)] = block;
         wtf_do[@intFromEnum(WTFDoDim.vulnerable)] = vulnerable;
         wtf_do[@intFromEnum(WTFDoDim.cost)] = cost;
+        wtf_do[@intFromEnum(WTFDoDim.aoe)] = aoe;
         try self.wtf_do.append(wtf_do);
 
         var d_upgrade_wtf_do = std.mem.zeroes(@Vector(@intFromEnum(WTFDoDim.len), u8));
         d_upgrade_wtf_do[@intFromEnum(WTFDoDim.damage)] = d_upgrade_damage;
         d_upgrade_wtf_do[@intFromEnum(WTFDoDim.block)] = d_upgrade_block;
         d_upgrade_wtf_do[@intFromEnum(WTFDoDim.vulnerable)] = d_upgrade_vulnerable;
+        d_upgrade_wtf_do[@intFromEnum(WTFDoDim.cost)] = d_upgrade_cost;
         try self.d_upgrade_wtf_do.append(d_upgrade_wtf_do);
 
         try self.map.put(duped_name, self.count);

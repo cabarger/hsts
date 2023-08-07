@@ -31,17 +31,18 @@ const portrait_padding = 2;
 
 // Temp. homes for some of these guys --------------------------------------------------------------
 
+const MonsterType = enum {
+    cultist,
+    jaw_worm,
+    louse,
+    s_acid_slime,
+    s_spike_slime,
+    m_acid_slime,
+    m_spike_slime,
+};
+
 const Monster = struct {
-    pub const Type = enum {
-        cultist,
-        jaw_worm,
-        louse,
-        s_acid_slime,
-        s_spike_slime,
-        m_acid_slime,
-        m_spike_slime,
-    };
-    type: Type,
+    type: MonsterType,
     hp: u16,
     max_hp: u16,
 };
@@ -72,6 +73,7 @@ const Act1Encounter = enum {
     jaw_worm,
     two_louses,
     small_slimes,
+
     gremlin_gang,
     large_slime,
     lots_of_slimes,
@@ -100,7 +102,8 @@ const Relic = enum {
 };
 
 const GameMode = enum {
-    overlay, // i.e things like map, draw pile, discard pile...
+    /// i.e things like map, draw pile, discard pile...
+    overlay,
     nav,
     combat,
     event,
@@ -113,11 +116,12 @@ const Overlay = enum {
     map,
 };
 
+const DeckType = enum {
+    perm,
+    tmp,
+};
+
 const CardHandle = struct {
-    const DeckType = enum {
-        perm,
-        tmp,
-    };
     deck_type: DeckType,
     index: u8,
 };
@@ -221,9 +225,11 @@ const GameState = struct {
         return @as(Cards.Type, @enumFromInt(self.cardFromHandle(card_handle).wtf_do[@intFromEnum(Cards.WTFDoDim.card_type)]));
     }
 
-    pub fn isPlayableCard(self: *Self, card_handle: CardHandle) bool {
+    pub fn canPlayCard(self: *Self, card_handle: CardHandle) bool {
+        const card = self.cardFromHandle(card_handle);
+        const cost = card.wtf_do[@intFromEnum(Cards.WTFDoDim.cost)];
         const card_type = self.cardTypeFromHandle(card_handle);
-        if (card_type != .status and card_type != .curse) // TODO(caleb): relics that allow you to play these cards.
+        if (card_type != .status and card_type != .curse and self.energy >= cost) // TODO(caleb): relics that allow you to play these cards.
             return true;
         return false;
     }
@@ -324,10 +330,6 @@ pub fn main() !void {
     const stdout_file = std.io.getStdOut();
     const stdin_file = std.io.getStdIn();
     const stdout = stdout_file.writer();
-    var stdin_buf: [1024]u8 = undefined;
-    var stdin_fbs = std.io.fixedBufferStream(&stdin_buf);
-    var stdin_writer = stdin_fbs.writer();
-    _ = stdin_writer;
     const stdin = stdin_file.reader();
     const tty = std.io.tty.detectConfig(stdout_file);
 
@@ -457,40 +459,59 @@ pub fn main() !void {
             },
             .combat => {
                 if (!gs.did_start_of_turn_stuff) { // Handle start of turn
+                    gs.energy = gs.base_energy;
                     try gs.drawCards(rng);
                     // NOTE(caleb): ^This^ and probably 30 other things.
                     gs.did_start_of_turn_stuff = true;
                 }
                 const option_index: ?u8 = fmt.charToDigit(frame_input, 10) catch null;
                 if (option_index != null) {
-                    if (option_index.? < gs.cards_in_hand) {
-                        // If a card is selected already attempt to play the card
-                        if (gs.selected_card_index != null and option_index.? == gs.selected_card_index.?) {
-                            // TODO(caleb): Energy....
-                            const card_to_play = gs.hand[option_index.?];
+                    if (option_index.? < gs.cards_in_hand) { // FIXME(caleb): Jank logic
+                        if (gs.selected_card_index != null and
+                            (option_index.? == gs.selected_card_index.? or gs.target_index == null))
+                        {
+                            const card_handle = gs.hand[gs.selected_card_index.?];
+                            if (gs.canPlayCard(card_handle)) {
+                                const card = gs.cardFromHandle(card_handle);
+                                const card_type = gs.cardTypeFromHandle(card_handle);
+                                const is_aoe = card.wtf_do[@intFromEnum(Cards.WTFDoDim.aoe)] != 0;
 
-                            if (gs.isPlayableCard(gs.hand[option_index.?])) {
-                                const card_type = gs.cardTypeFromHandle(gs.hand[option_index.?]);
-
-                                // NOTE(caleb): Need to validate
-                                if (card_type == .attack and gs.target_index == null) { // NOTE(caleb): Attacks can be ambigous so a target will need to be supplied.
-                                    frame_input = 0;
-                                    continue;
+                                switch (card_type) {
+                                    .skill => {},
+                                    .status => {},
+                                    .attack => {
+                                        if (gs.target_index == null and !is_aoe) {
+                                            if (option_index.? >= gs.n_monsters_in_combat) {
+                                                frame_input = 0;
+                                                continue;
+                                            }
+                                            gs.target_index = option_index.?;
+                                        }
+                                        if (!is_aoe) {
+                                            if (@as(i8, @intCast(gs.monsters_in_combat[gs.target_index.?].hp)) - @as(i8, @intCast(card.dim(.damage))) > 0) {
+                                                gs.monsters_in_combat[gs.target_index.?].hp -= card.dim(.damage);
+                                            } else gs.monsters_in_combat[gs.target_index.?].hp = 0;
+                                        } else unreachable;
+                                    },
+                                    .power => {},
+                                    .curse => {},
                                 }
 
-                                // Clear selected card
-                                gs.selected_card_index = null;
+                                std.debug.assert(@as(i8, @intCast(gs.energy)) - @as(i8, @intCast(card.dim(.cost))) >= 0);
+                                gs.energy -= card.dim(.cost);
+
+                                // TODO(caleb): discard_pile or exhaust_pile
+                                try gs.discard_pile.append(gs.hand[gs.selected_card_index.?]);
 
                                 // Remove the card from hand
                                 gs.cards_in_hand -= 1;
                                 if (gs.cards_in_hand > 0)
-                                    gs.hand[option_index.?] = gs.hand[gs.cards_in_hand];
+                                    gs.hand[gs.selected_card_index.?] = gs.hand[gs.cards_in_hand];
 
-                                // TODO(caleb): discard_pile or exhaust_pile
-                                try gs.discard_pile.append(gs.hand[option_index.?]);
+                                // Clear selected card and target
+                                gs.selected_card_index = null;
+                                gs.target_index = null;
                             }
-
-                            _ = card_to_play;
                         } else gs.selected_card_index = option_index.?; // Select the card
                     }
                 } else if (frame_input == 'e') {
@@ -594,9 +615,9 @@ pub fn main() !void {
                         portrait_line = portrait_iter.next();
                     }
                     try moveCursor(stdout, pane_row_offset + art.portrait_rows + 1, col_offset);
-                    num_bars_to_color_red = @intFromFloat(@as(f32, @floatFromInt(monster.max_hp)) / @as(f32, @floatFromInt(monster.max_hp)) * @as(f32, art.portrait_cols));
+                    num_bars_to_color_red = @intFromFloat((@as(f32, @floatFromInt(monster.hp)) / @as(f32, @floatFromInt(monster.max_hp))) * @as(f32, art.portrait_cols));
                     for (0..art.portrait_cols) |hp_bar_col_index| {
-                        if (hp_bar_col_index <= num_bars_to_color_red) {
+                        if (hp_bar_col_index < num_bars_to_color_red) {
                             try tty.setColor(stdout, .red);
                         } else try tty.setColor(stdout, .white);
                         try stdout.writeAll("█");
